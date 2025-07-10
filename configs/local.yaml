@@ -1,0 +1,17 @@
+nats:
+  queue: "events"
+db:
+  user: "admin"
+  password: "admin"
+  host: "localhost"
+  port: "5432"
+  db_name: "events"
+redis:
+  redis_addr: "localhost:6379"
+  password: ""
+  user: ""
+  db: 1
+  max_retries: 3
+  retry_delay: "5s"
+  dial_timeout: "10s"
+  timeout: "5s"

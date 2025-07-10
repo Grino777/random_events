@@ -1,0 +1,88 @@
+services:
+  nats:
+    image: nats:latest
+    container_name: nats-server
+    ports:
+      - "4222:4222" # Порт для клиентов
+      - "8222:8222" # Порт для мониторинга HTTP
+    command: "--jetstream --store_dir=/data/jetstream --http_port 8222"
+    volumes:
+      - nats-data:/data/jetstream
+    networks:
+      - nats-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  db:
+    image: postgres:latest
+    container_name: event-db
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=events
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=admin
+    volumes:
+      - events-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - db-network
+
+  cloudbeaver:
+    container_name: cloudbeaver
+    image: dbeaver/cloudbeaver:latest
+    ports:
+      - "8978:8978"
+    volumes:
+      - cloudbeaver:/opt/cloudbeaver/workspace
+    networks:
+      - db-network
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - CB_SERVER_URL=http://localhost:8978
+      - CB_SERVER_NAME=CloudBeaver
+
+  redis:
+    image: redis:latest
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - db-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  nats-data:
+    name: nats-data
+  events-db-data:
+    name: events-db-data
+  cloudbeaver:
+    name: cloudbeaver
+  redis-data:
+    name: redis-data
+
+networks:
+  nats-network:
+    name: nats
+    driver: bridge
+  db-network:
+    name: db
+    driver: bridge
