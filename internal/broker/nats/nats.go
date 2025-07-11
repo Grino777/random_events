@@ -31,8 +31,7 @@ type Broker interface {
 	Close(ctx context.Context)
 	PublishEvent(data []byte) error
 	ListenStream(
-		ctx context.Context,
-		tasksChan chan models.EventMessage,
+		tasksChan chan models.BrokerMessage,
 		messageCount int,
 	)
 }
@@ -159,17 +158,6 @@ func (nb *natsBroker) createConsumer() error {
 	nb.log.Debug("consumer created", "queue", nb.queueName)
 	nb.consumer = consumer
 	return nil
-}
-
-func (nb *natsBroker) getConsumer() (jetstream.Consumer, error) {
-	if nb.consumer != nil {
-		return nb.consumer, nil
-	}
-	err := nb.createConsumer()
-	if err != nil {
-		return nil, err
-	}
-	return nb.consumer, nil
 }
 
 func (nb *natsBroker) initJetStream() error {

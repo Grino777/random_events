@@ -11,14 +11,13 @@ import (
 )
 
 const (
-	workerCount      = 5
+	workerCount      = 10
 	messageRejectTTL = 5 * time.Second
 )
 
 type Broker interface {
 	ListenStream(
-		ctx context.Context,
-		tasksChan chan models.EventMessage,
+		tasksChan chan models.BrokerMessage,
 		messageCount int,
 	)
 }
@@ -29,18 +28,21 @@ type DbClient interface {
 
 type RedisClient interface {
 	SaveProcessedEvent(context.Context, *models.Event) error
+	DeleteProcessedEvent(context.Context, *models.Event) error
 	EventExists(senderId, payload string, createdAt int64) (bool, error)
 }
 
 type Workers interface {
 	Start()
+	Stop(context.Context) error
 }
 
 type WorkerStore struct {
 	workerCount int
 	workers     []*Worker
-	tasksChan   chan models.EventMessage
-	ctx         context.Context
+	tasksChan   chan models.BrokerMessage
+	ctx         context.Context    // Внутренний WithCancel контекст воркера
+	cancel      context.CancelFunc // Функция отмены контекста WorkerStore, для завершения воркеров
 	log         *slog.Logger
 	lastWorker  int
 	redis       RedisClient
@@ -50,19 +52,21 @@ type WorkerStore struct {
 }
 
 func NewWorkerStore(
-	ctx context.Context,
 	log *slog.Logger,
 	rc RedisClient,
 	dc DbClient,
 	broker Broker,
 ) Workers {
+	ctx, cancel := context.WithCancel(context.Background())
+
 	store := &WorkerStore{
 		workerCount: workerCount,
 		workers:     make([]*Worker, workerCount),
-		tasksChan:   make(chan models.EventMessage, workerCount*2),
+		tasksChan:   make(chan models.BrokerMessage, workerCount*2),
 		broker:      broker,
 		log:         log,
 		ctx:         ctx,
+		cancel:      cancel,
 		lastWorker:  -1,
 		redis:       rc,
 		db:          dc,
@@ -74,11 +78,12 @@ func (ws *WorkerStore) Start() {
 	for i := range ws.workerCount {
 		worker := &Worker{
 			ID:          i,
-			tasksChan:   make(chan models.EventMessage, 1),
+			tasksChan:   make(chan models.BrokerMessage, 1),
 			log:         ws.log,
 			redisClient: ws.redis,
 			dbClient:    ws.db,
 			ctx:         ws.ctx,
+			Status:      Available,
 		}
 
 		ws.workers[i] = worker
@@ -94,25 +99,13 @@ func (ws *WorkerStore) Start() {
 
 	ws.wg.Add(1)
 	go ws.startListener()
-
-	<-ws.ctx.Done()
-	if err := ws.Stop(); err != nil {
-		ws.log.Error("failed to stop workers", logger.Error(err))
-	}
-	// go func() {
-	// 	<-ws.ctx.Done()
-	// 	if err := ws.Stop(); err != nil {
-	// 		ws.log.Error("failed to stop workers", logger.Error(err))
-	// 	}
-	// }()
 }
 
-func (ws *WorkerStore) Stop() error {
+func (ws *WorkerStore) Stop(ctx context.Context) error {
 	ws.log.Info("stopping WorkerStore")
+	ws.cancel()
 
-	// Создаем контекст с таймаутом для завершения
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	close(ws.tasksChan)
 
 	// Ожидаем завершения всех горутин
 	done := make(chan struct{})
@@ -121,17 +114,6 @@ func (ws *WorkerStore) Stop() error {
 		close(done)
 	}()
 
-	ws.log.Debug("all worker gorutines stopped")
-
-	// Закрываем канал tasksChan, чтобы диспетчер задач прекратил работу
-	close(ws.tasksChan)
-
-	// Закрываем каналы tasksChan для всех воркеров
-	for _, worker := range ws.workers {
-		close(worker.tasksChan)
-	}
-
-	// Ожидаем завершения или таймаута
 	select {
 	case <-done:
 		ws.log.Info("all workers and dispatcher stopped")
@@ -141,39 +123,6 @@ func (ws *WorkerStore) Stop() error {
 		return ctx.Err()
 	}
 }
-
-// func (ws *WorkerStore) Stop() error {
-// 	ws.log.Info("stopping tasks dispatch in Worker Store")
-
-// 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-// 	defer cancel()
-
-// 	// Ожидаем завершения всех воркеров и диспетчера
-// 	done := make(chan struct{})
-// 	go func() {
-// 		ws.wg.Wait()
-// 		close(done)
-// 	}()
-
-// 	// Ожидаем завершения или таймаута
-// 	select {
-// 	case <-done:
-// 		ws.log.Info("all workers and dispatcher stopped")
-// 		close(ws.tasksChan)
-// 		// Закрываем каналы Tasks для всех воркеров
-// 		for _, worker := range ws.workers {
-// 			close(worker.tasksChan)
-// 		}
-// 		return nil
-// 	case <-ctx.Done():
-// 		ws.log.Warn("WorkerStore shutdown timeout, forcing exit")
-// 		close(ws.tasksChan)
-// 		for _, worker := range ws.workers {
-// 			close(worker.tasksChan)
-// 		}
-// 		return ctx.Err()
-// 	}
-// }
 
 func (ws *WorkerStore) dispatchTasks() {
 	defer ws.wg.Done()
@@ -195,11 +144,16 @@ func (ws *WorkerStore) dispatchTasks() {
 	}
 }
 
-func (ws *WorkerStore) dispatchToWorker(msg models.EventMessage) {
+func (ws *WorkerStore) dispatchToWorker(msg models.BrokerMessage) {
 	ctxTimeout, cancel := context.WithTimeout(ws.ctx, messageRejectTTL)
 	defer cancel()
 
-	for {
+Loop:
+	// Проверяем все воркеры в цикле round-robin
+	for i := 0; i < ws.workerCount; i++ {
+		ws.lastWorker = (ws.lastWorker + 1) % ws.workerCount
+		worker := ws.workers[ws.lastWorker]
+
 		select {
 		case <-ws.ctx.Done():
 			ws.log.Debug("task dispatcher stopped while dispatching task")
@@ -216,32 +170,28 @@ func (ws *WorkerStore) dispatchToWorker(msg models.EventMessage) {
 			msg.Close()
 			return
 		default:
-			// Round-robin выбор воркера
-			ws.lastWorker = (ws.lastWorker + 1) % ws.workerCount
-			worker := ws.workers[ws.lastWorker]
-
-			select {
-			case worker.tasksChan <- msg:
-				ws.log.Debug("task dispatched to worker", "worker_id", worker.ID)
-				return
-			default:
-				for i := 0; i < ws.workerCount; i++ {
-					workerIndex := (ws.lastWorker + i) % ws.workerCount
-					worker = ws.workers[workerIndex]
-					worker.tasksChan <- msg
-					ws.lastWorker = workerIndex
+			// Проверяем статус воркера
+			if worker.Status == Available {
+				select {
+				case worker.tasksChan <- msg:
 					ws.log.Debug("task dispatched to worker", "worker_id", worker.ID)
 					return
+				default:
+					// Канал воркера занят, пробуем следующего
+					continue
 				}
 			}
+			// Если воркер не доступен (Busy или Closed), пробуем следующего
 		}
 	}
+
+	goto Loop
 }
 
 func (ws *WorkerStore) startListener() {
 	defer ws.wg.Done()
 
 	ws.log.Debug("stream listener started")
-	ws.broker.ListenStream(ws.ctx, ws.tasksChan, ws.workerCount)
+	ws.broker.ListenStream(ws.tasksChan, ws.workerCount)
 	ws.log.Info("stream listener stopped")
 }

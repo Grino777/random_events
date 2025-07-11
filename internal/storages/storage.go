@@ -29,6 +29,7 @@ type RedisConnection interface {
 type RedisEvents interface {
 	SaveFailedEvent(data []byte) error
 	SaveProcessedEvent(ctx context.Context, event *models.Event) error
+	DeleteProcessedEvent(ctx context.Context, event *models.Event) error
 	EventExists(senderId, payload string, createdAt int64) (bool, error)
 }
 

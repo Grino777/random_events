@@ -27,7 +27,8 @@ type RedisConnection interface {
 
 type RedisEvents interface {
 	SaveFailedEvent(data []byte) error
-	SaveProcessedEvent(context.Context, *models.Event) error
+	SaveProcessedEvent(ctx context.Context, event *models.Event) error
+	DeleteProcessedEvent(ctx context.Context, event *models.Event) error
 	EventExists(senderId, payload string, createdAt int64) (bool, error)
 }
 
@@ -36,8 +37,7 @@ type Broker interface {
 	Close(ctx context.Context)
 	PublishEvent(data []byte) error
 	ListenStream(
-		ctx context.Context,
-		tasksChan chan models.EventMessage,
+		tasksChan chan models.BrokerMessage,
 		messageCount int,
 	)
 }
@@ -54,6 +54,7 @@ type Storage interface {
 
 type Workers interface {
 	Start()
+	Stop(context.Context) error
 }
 
 type App struct {
@@ -110,17 +111,17 @@ func (a *App) Start(errChan chan error) error {
 		}
 	}()
 
-	a.workers = worker.NewWorkerStore(a.ctx, a.log, a.redis, a.db, a.broker)
+	a.workers = worker.NewWorkerStore(a.log, a.redis, a.db, a.broker)
 	a.workers.Start()
 
-	<-a.ctx.Done()
-	a.Stop()
 	return nil
 }
 
 func (a *App) Stop() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+
+	a.workers.Stop(ctx)
 
 	if a.redis != nil {
 		if err := a.redis.Close(ctx); err != nil {

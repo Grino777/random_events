@@ -30,21 +30,15 @@ func main() {
 		}
 	}()
 
-	// Ожидаем завершения всех горутин
-	done := make(chan struct{})
-	go func() {
-		app.Wg.Wait()
-		close(done)
-	}()
-
 	select {
 	case <-sigChan:
 		log.Info("received shutdown signal")
-		cancel()
 	case err := <-errChan:
 		log.Error("application stopped with error", logger.Error(err))
-		cancel()
 	}
+
+	cancel()
+	app.Stop()
 
 	log.Info("Application shutdown")
 }

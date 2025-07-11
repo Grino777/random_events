@@ -2,7 +2,6 @@ package worker
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -15,17 +14,30 @@ const (
 	opWorker = "consumer.store."
 )
 
+// worker statuses
+const (
+	Busy      = "busy"
+	Available = "available"
+	Closed    = "closed"
+)
+
 type Worker struct {
 	ID          int
-	tasksChan   chan models.EventMessage
+	tasksChan   chan models.BrokerMessage
 	log         *slog.Logger
 	redisClient RedisClient
 	dbClient    DbClient
 	ctx         context.Context
+	Status      string
 }
 
 func (w *Worker) Start() {
 	w.log.Info("worker started", "worker_id", w.ID)
+	defer func() {
+		defer close(w.tasksChan)
+		w.Status = Closed
+	}()
+
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -43,130 +55,101 @@ func (w *Worker) Start() {
 	}
 }
 
-func (w *Worker) processMessage(msg models.EventMessage) error {
+func (w *Worker) processMessage(msg models.BrokerMessage) error {
 	const op = opWorker + "processMessage"
 
-	defer msg.Close()
+	defer func() {
+		msg.Close()
+		w.Status = Available
+	}()
 
-	event := &models.Event{}
-	if err := json.Unmarshal(msg.Data(), event); err != nil {
-		w.log.Error("failed to unmarshal event", "worker_id", w.ID, logger.Error(err))
-		return fmt.Errorf("%s: %v", op, err)
+	w.Status = Busy
+
+	select {
+	case <-w.ctx.Done():
+		return fmt.Errorf("%s: task processing interrupted due to context cancellation, worker_id: %d", op, w.ID)
+	default:
+		event, err := models.EventFromJSON(msg.Data())
+		if err != nil {
+			return w.rejectMessage(op, msg, err)
+		}
+
+		if err := w.checkExistsEvent(event, msg); err != nil {
+			return err
+		}
+
+		// Имитация времени выполнения события с учетом контекста
+		sleepTime := time.Duration(event.ExecTime) * time.Second
+		timer := time.NewTimer(sleepTime)
+		// Останавливаем таймер, чтобы избежать утечек
+		defer timer.Stop()
+
+		select {
+		case <-w.ctx.Done():
+			if err := msg.Reject(); err != nil {
+				w.log.Error("failed to reject broker message", logger.Error(err))
+				return fmt.Errorf("%s: task processing interrupted due to context cancellation, worker_id: %d", op, w.ID)
+			}
+			return w.ctx.Err()
+		case <-timer.C:
+			// Таймер сработал, продолжаем обработку
+		}
+
+		if err := w.saveMessage(event, msg); err != nil {
+			return w.rejectMessage(op, msg, err)
+		}
+		return nil
 	}
+}
 
-	// Проверка на уже обработанный event
+func (w *Worker) rejectMessage(op string, msg models.BrokerMessage, err error) error {
+	if rejectErr := msg.Reject(); rejectErr != nil {
+		return fmt.Errorf("%s: failed to reject broker message %v", op, rejectErr)
+	}
+	return fmt.Errorf("%s: %v", op, err)
+}
+
+// Проверка на уже обработанный event
+func (w *Worker) checkExistsEvent(event *models.Event, msg models.BrokerMessage) error {
+	const op = opWorker + "checkExistsEvent"
+
 	exist, err := w.redisClient.EventExists(event.SenderId, event.Payload, event.CreatedAt)
 	if err != nil {
-		if err := msg.Reject(); err != nil {
-			w.log.Error("failed to reject broker message", logger.Error(err))
-			return fmt.Errorf("%s: %v", op, err)
-		}
-		return fmt.Errorf("%s: %v", op, err)
+		return w.rejectMessage(op, msg, err)
 	}
 	if exist {
 		w.log.Debug("event already exists")
 		if err := msg.Accept(); err != nil {
-			w.log.Error("failed to accept broker message", logger.Error(err))
-			return fmt.Errorf("%s: %v", op, err)
+			return fmt.Errorf("%s: failed to accept broker message %v", op, err)
 		}
-		return nil
 	}
-
-	// Имитация времени выполнения события с учетом контекста
-	sleepTime := time.Duration(event.ExecTime) * time.Second
-	timer := time.NewTimer(sleepTime)
-	defer timer.Stop() // Останавливаем таймер, чтобы избежать утечек
-	select {
-	case <-w.ctx.Done():
-		w.log.Info("task processing interrupted due to context cancellation", "worker_id", w.ID)
-		if err := msg.Reject(); err != nil {
-			w.log.Error("failed to reject broker message", logger.Error(err))
-			return fmt.Errorf("%s: %v", op, err)
-		}
-		return w.ctx.Err()
-	case <-timer.C:
-		// Таймер сработал, продолжаем обработку
-	}
-
-	if err := w.redisClient.SaveProcessedEvent(w.ctx, event); err != nil {
-		if err := msg.Reject(); err != nil {
-			w.log.Error("failed to reject broker message", logger.Error(err))
-			return fmt.Errorf("%s: %v", op, err)
-		}
-		return err
-	}
-
-	if err := w.dbClient.SaveProcessedEvent(w.ctx, event); err != nil {
-		if err := msg.Reject(); err != nil {
-			w.log.Error("failed to reject broker message", logger.Error(err))
-			return fmt.Errorf("%s: %v", op, err)
-		}
-		return err
-	}
-
-	if err := msg.Accept(); err != nil {
-		w.log.Error("failed to accept broker message", logger.Error(err))
-		return fmt.Errorf("%s: %v", op, err)
-	}
-	w.log.Debug("message accept and save", "worker_id", w.ID)
-
 	return nil
 }
 
-// func (w *Worker) processMessage(msg models.EventMessage) error {
-// 	const op = opWorker + "processMessage"
+func (w *Worker) saveMessage(event *models.Event, msg models.BrokerMessage) error {
+	const op = opWorker + "saveMessage"
 
-// 	defer msg.Close()
+	select {
+	case <-w.ctx.Done():
+		return fmt.Errorf("cancelled save message due to context concellation")
+	default:
+		if err := w.redisClient.SaveProcessedEvent(w.ctx, event); err != nil {
+			return w.rejectMessage(op, msg, err)
+		}
 
-// 	event := &models.Event{}
-// 	if err := json.Unmarshal(msg.Data(), event); err != nil {
-// 		w.log.Error("failed to unmarshal event", "worker_id", w.ID, "error", err)
-// 		return fmt.Errorf("%s: %v", op, err)
-// 	}
-
-// 	// Проверка на уже обработанный event
-// 	exist, err := w.redisClient.EventExists(event.SenderId, event.Payload, event.CreatedAt)
-// 	if err != nil {
-// 		if err := msg.Reject(); err != nil {
-// 			w.log.Error("failed to reject broker message")
-// 			return fmt.Errorf("%s: %v", op, err)
-// 		}
-// 		return fmt.Errorf("%s: %v", op, err)
-// 	}
-// 	if exist {
-// 		w.log.Debug("event alreay exist")
-// 		if err := msg.Accept(); err != nil {
-// 			w.log.Error("failed to accept broker message")
-// 			return fmt.Errorf("%s: %v", op, err)
-// 		}
-// 		return nil
-// 	}
-
-// 	// Имитация времени выполнения события
-// 	sleepTime := time.Duration(event.ExecTime) * time.Second
-// 	time.Sleep(sleepTime)
-
-// 	ctx := context.TODO()
-// 	if err := w.redisClient.SaveProcessedEvent(ctx, event); err != nil {
-// 		if err := msg.Reject(); err != nil {
-// 			w.log.Error("failed to reject broker message")
-// 			return fmt.Errorf("%s: %v", op, err)
-// 		}
-// 		return err
-// 	}
-
-// 	if err := w.dbClient.SaveProcessedEvent(event); err != nil {
-// 		if err := msg.Reject(); err != nil {
-// 			w.log.Error("failed to reject broker message")
-// 			return fmt.Errorf("%s: %v", op, err)
-// 		}
-// 		return err
-// 	}
-
-// 	if err := msg.Accept(); err != nil {
-// 		w.log.Error("failed to accept broker message")
-// 	}
-// 	w.log.Debug("message accept and save", "worker_id", w.ID)
-
-// 	return nil
-// }
+		// Попытка сохранить в PostgreSQL
+		if err := w.dbClient.SaveProcessedEvent(w.ctx, event); err != nil {
+			if deleteErr := w.redisClient.DeleteProcessedEvent(w.ctx, event); deleteErr != nil {
+				w.log.Error("failed to rollback Redis save", logger.Error(deleteErr))
+				// Не возвращаем deleteErr, чтобы основная ошибка от PostgreSQL осталась приоритетной
+			}
+			return w.rejectMessage(op, msg, err)
+		}
+		if err := msg.Accept(); err != nil {
+			w.log.Error("failed to accept broker message but massage saved", "worker_id", w.ID, logger.Error(err))
+			return fmt.Errorf("%s: %v", op, err)
+		}
+		w.log.Debug("message accept and saved", "worker_id", w.ID)
+	}
+	return nil
+}

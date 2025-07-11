@@ -2,10 +2,15 @@ package models
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"time"
 
 	"math/rand"
+)
+
+const (
+	opEvent = "domain.event."
 )
 
 const (
@@ -58,14 +63,21 @@ func (e *Event) generateRandomExecTime() {
 }
 
 func (e *Event) ToJSON() ([]byte, error) {
-	return json.Marshal(e)
+	const op = opEvent + "ToJSON"
+	data, err := json.Marshal(e)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %v", op, err)
+	}
+	return data, nil
 }
 
-func FromJSON(data []byte) (*Event, error) {
-	var event Event
+func EventFromJSON(data []byte) (*Event, error) {
+	const op = opEvent + "FromJSON"
+
+	var event *Event
 	err := json.Unmarshal(data, &event)
 	if err != nil {
 		return nil, err
 	}
-	return &event, nil
+	return event, nil
 }

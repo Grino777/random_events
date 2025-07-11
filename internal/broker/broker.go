@@ -13,8 +13,7 @@ type Broker interface {
 	Close(ctx context.Context)
 	PublishEvent(data []byte) error
 	ListenStream(
-		ctx context.Context,
-		tasksChan chan models.EventMessage,
+		tasksChan chan models.BrokerMessage,
 		messageCount int,
 	)
 }
@@ -66,9 +65,8 @@ func (b *brokerObj) PublishEvent(data []byte) error {
 }
 
 func (b *brokerObj) ListenStream(
-	ctx context.Context,
-	tasksChan chan models.EventMessage,
+	tasksChan chan models.BrokerMessage,
 	messageCount int,
 ) {
-	b.broker.ListenStream(ctx, tasksChan, messageCount)
+	b.broker.ListenStream(tasksChan, messageCount)
 }

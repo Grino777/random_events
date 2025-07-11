@@ -57,7 +57,7 @@ func (ps *PostgresStorage) Close(ctx context.Context) error {
 func (ps *PostgresStorage) getDbPool(ctx context.Context) (*pgxpool.Pool, error) {
 	const op = opPostgres + "getDbPool"
 
-	// Подключение к системной базе (например, postgres) для проверки/создания базы events
+	// Подключение к системной базе для проверки/создания базы events
 	connStr := fmt.Sprintf("postgres://%s:%s@%s:%s/postgres?sslmode=disable",
 		ps.cfg.User, ps.cfg.Password, ps.cfg.Host, ps.cfg.Port)
 	config, err := pgxpool.ParseConfig(connStr)
@@ -125,7 +125,6 @@ func (ps *PostgresStorage) createTable() error {
 	)
 	_, err := ps.client.Exec(ctx, createTableQuery)
 	if err != nil {
-		// Закрываем соединение в случае ошибки
 		ps.client.Close()
 		return fmt.Errorf("%s: failed to create successEvent table: %w", op, err)
 	}
